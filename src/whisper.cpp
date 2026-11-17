@@ -169,11 +169,18 @@ static bool ggml_graph_compute_helper(
     return ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS;
 }
 
+// CPU backend functions (ggml-cpu.h), looked up through the backend registry
+// so that they also work when the CPU backend is a loadable library
+typedef struct ggml_threadpool * (*whisper_threadpool_new_t)(struct ggml_threadpool_params * params);
+typedef void (*whisper_threadpool_free_t)(struct ggml_threadpool * threadpool);
+typedef void (*whisper_set_threadpool_t)(ggml_backend_t backend, struct ggml_threadpool * threadpool);
+
 static bool ggml_graph_compute_helper(
       ggml_backend_sched_t   sched,
         struct ggml_cgraph * graph,
                        int   n_threads,
-                      bool   sched_reset = true) {
+                      bool   sched_reset = true,
+     struct ggml_threadpool * threadpool  = nullptr) {
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -182,6 +189,13 @@ static bool ggml_graph_compute_helper(
         auto * fn_set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (fn_set_n_threads) {
             fn_set_n_threads(backend, n_threads);
+        }
+
+        // without a threadpool the CPU backend creates and joins n_threads - 1
+        // threads for every graph
+        auto * fn_set_threadpool = (whisper_set_threadpool_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (fn_set_threadpool) {
+            fn_set_threadpool(backend, threadpool);
         }
     }
 
@@ -920,7 +934,60 @@ struct whisper_state {
     bool has_vad_segments = false;
 
     std::vector<vad_time_mapping> vad_mapping_table;
+
+    // CPU threadpool for the graphs of this state (whisper_state_threadpool)
+    struct ggml_threadpool * threadpool = nullptr;
+    int threadpool_n_threads = 0;
 };
+
+// Detaches the threadpool of the state from its CPU backend and frees it.
+static void whisper_state_threadpool_free(whisper_state & wstate) {
+    if (!wstate.threadpool) {
+        return;
+    }
+    whisper_threadpool_free_t fn_free = nullptr;
+    for (auto & backend : wstate.backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * fn_set_threadpool = reg ? (whisper_set_threadpool_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool") : nullptr;
+        if (fn_set_threadpool) {
+            fn_set_threadpool(backend, nullptr);
+            fn_free = (whisper_threadpool_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        }
+    }
+    if (fn_free) {
+        fn_free(wstate.threadpool);
+    }
+    wstate.threadpool = nullptr;
+    wstate.threadpool_n_threads = 0;
+}
+
+// The threadpool for running the graphs of the state on n_threads threads,
+// made on first use and made again when the thread count changes. Token
+// decoding computes one small graph per token: without a pool that stays,
+// ggml creates and joins n_threads - 1 threads for each of them.
+// nullptr: one thread, or no CPU backend.
+static struct ggml_threadpool * whisper_state_threadpool(whisper_state & wstate, int n_threads) {
+    if (n_threads <= 1) {
+        return nullptr;
+    }
+    if (wstate.threadpool && wstate.threadpool_n_threads == n_threads) {
+        return wstate.threadpool;
+    }
+    whisper_state_threadpool_free(wstate);
+    for (auto & backend : wstate.backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * fn_new = reg ? (whisper_threadpool_new_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new") : nullptr;
+        if (fn_new && ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool")) {
+            struct ggml_threadpool_params params = ggml_threadpool_params_default(n_threads);
+            wstate.threadpool = fn_new(&params);
+            wstate.threadpool_n_threads = wstate.threadpool ? n_threads : 0;
+            break;
+        }
+    }
+    return wstate.threadpool;
+}
 
 struct whisper_context {
     int64_t t_load_us  = 0;
@@ -2448,7 +2515,7 @@ static bool whisper_encode_internal(
         }
 
         if (!whisper_encode_external(wstate)) {
-            if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+            if (!ggml_graph_compute_helper(sched, gf, n_threads, true, whisper_state_threadpool(wstate, n_threads))) {
                 return false;
             }
         } else {
@@ -2492,7 +2559,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, whisper_state_threadpool(wstate, n_threads))) {
             return false;
         }
     }
@@ -2508,7 +2575,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, whisper_state_threadpool(wstate, n_threads))) {
             return false;
         }
     }
@@ -3005,7 +3072,7 @@ static bool whisper_decode_internal(
 
         logits = ggml_graph_node(gf, -1);
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, whisper_state_threadpool(wstate, n_threads))) {
             return false;
         }
     }
@@ -3932,6 +3999,8 @@ struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loa
 
 void whisper_free_state(struct whisper_state * state) {
     if (state) {
+        whisper_state_threadpool_free(*state);
+
         whisper_kv_cache_free(state->kv_self);
         whisper_kv_cache_free(state->kv_cross);
         whisper_kv_cache_free(state->kv_pad);
