@@ -162,6 +162,51 @@ bool ggml_common_quantize_0(
             }
 
             ttype = qtype;
+
+            // [whisper-opt] mixed precision: QUANT_OVERRIDE="regex=type;regex=type"
+            // (type: q4_0 q5_0 q8_0 q4_k q5_k q6_k f16; rows must fit the type's blocks)
+            if (const char * ov = getenv("QUANT_OVERRIDE")) {
+                std::string all(ov);
+                size_t p = 0;
+                while (p < all.size()) {
+                    size_t e = all.find(';', p);
+                    if (e == std::string::npos) e = all.size();
+                    std::string item = all.substr(p, e - p);
+                    p = e + 1;
+                    size_t eq = item.rfind('=');
+                    if (eq == std::string::npos) continue;
+                    if (!std::regex_match(name, std::regex(item.substr(0, eq)))) continue;
+                    std::string t = item.substr(eq + 1);
+                    ggml_type ot = GGML_TYPE_COUNT;
+                    if      (t == "q4_0") ot = GGML_TYPE_Q4_0;
+                    else if (t == "q5_0") ot = GGML_TYPE_Q5_0;
+                    else if (t == "q8_0") ot = GGML_TYPE_Q8_0;
+                    else if (t == "q4_k") ot = GGML_TYPE_Q4_K;
+                    else if (t == "q5_k") ot = GGML_TYPE_Q5_K;
+                    else if (t == "q6_k") ot = GGML_TYPE_Q6_K;
+                    else if (t == "f16")  ot = GGML_TYPE_F16;
+                    if (ot == GGML_TYPE_COUNT) {
+                        fprintf(stderr, "%s: QUANT_OVERRIDE: unknown type '%s'\n", __func__, t.c_str());
+                        return false;
+                    }
+                    if (ne[0] % ggml_blck_size(ot) != 0) {
+                        // e.g. k-quants (blocks of 256) on rows of 384
+                        printf("(override %s skipped: rows of %d) ", t.c_str(), ne[0]);
+                        break;
+                    }
+                    ttype = ot;
+                    printf("(override %s) ", t.c_str());
+                    break;
+                }
+            }
+            if (ttype == GGML_TYPE_F16) {
+                // keep as f16
+                data_u8.resize(nelements*sizeof(ggml_fp16_t));
+                for (int i = 0; i < nelements; ++i) {
+                    ((ggml_fp16_t *) data_u8.data())[i] = ggml_fp32_to_fp16(data_f32[i]);
+                }
+                quantize = false;
+            }
         } else {
             const int bpe = (ttype == 0) ? sizeof(float) : sizeof(uint16_t);
 

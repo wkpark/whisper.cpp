@@ -122,6 +122,24 @@ static int whisper_bench_full(const whisper_params & params) {
 
     whisper_reset_timings(ctx);
 
+    // [whisper-opt] BENCH_PHASE=enc|dec runs only that phase BENCH_REP times
+    const char * phase = getenv("BENCH_PHASE");
+    const int n_rep = getenv("BENCH_REP") ? atoi(getenv("BENCH_REP")) : 1;
+    if (phase) {
+        for (int r = 0; r < n_rep; r++) {
+            if (strcmp(phase, "enc") == 0) {
+                if (whisper_encode(ctx, 0, params.n_threads) != 0) return 4;
+            } else {
+                for (int i = 0; i < 256; i++) {
+                    if (whisper_decode(ctx, tokens, 1, i, params.n_threads) != 0) return 4;
+                }
+            }
+        }
+        whisper_print_timings(ctx);
+        whisper_free(ctx);
+        return 0;
+    }
+
     // actual run
     if (int ret = whisper_encode(ctx, 0, params.n_threads) != 0) {
         fprintf(stderr, "error: failed to encode: %d\n", ret);
