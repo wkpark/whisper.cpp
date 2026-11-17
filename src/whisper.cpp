@@ -169,11 +169,53 @@ static bool ggml_graph_compute_helper(
     return ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS;
 }
 
+// [whisper-opt] persistent CPU threadpools per state instead of the disposable
+// one ggml creates (and joins) for every graph, i.e. for every decoded token.
+// Enabled with WHISPER_OPT_TP=1; WHISPER_OPT_TP_POLL sets the polling level.
+// One pool per thread count in use, so that a graph never runs on a larger
+// pool whose extra workers would wake for it (token decoding may use fewer
+// threads than the encoder, WHISPER_OPT_DEC_T); ggml pauses the pool that is
+// switched away from. 1 thread: no pool, the graph runs on the calling thread.
+#define WHISPER_OPT_TP_MAX 16
+struct whisper_opt_threadpool {
+    struct ggml_threadpool * tp[WHISPER_OPT_TP_MAX + 1] = {}; // by thread count
+    bool any() const {
+        for (auto * p : tp) {
+            if (p) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+typedef struct ggml_threadpool * (*whisper_tp_new_t)(struct ggml_threadpool_params *);
+typedef void (*whisper_tp_free_t)(struct ggml_threadpool *);
+typedef void (*whisper_tp_set_t)(ggml_backend_t, struct ggml_threadpool *);
+
+static bool whisper_opt_env(const char * name, bool def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) != 0 : def;
+}
+
+static void whisper_opt_tp_free(whisper_opt_threadpool & otp) {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_reg_t reg = cpu ? ggml_backend_dev_backend_reg(cpu) : nullptr;
+    auto fn_free = reg ? (whisper_tp_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free") : nullptr;
+    for (auto & p : otp.tp) {
+        if (p && fn_free) {
+            fn_free(p);
+        }
+        p = nullptr;
+    }
+}
+
 static bool ggml_graph_compute_helper(
       ggml_backend_sched_t   sched,
         struct ggml_cgraph * graph,
                        int   n_threads,
-                      bool   sched_reset = true) {
+                      bool   sched_reset = true,
+     whisper_opt_threadpool * otp = nullptr) {
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -182,6 +224,26 @@ static bool ggml_graph_compute_helper(
         auto * fn_set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (fn_set_n_threads) {
             fn_set_n_threads(backend, n_threads);
+        }
+
+        auto fn_set_tp = reg ? (whisper_tp_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool") : nullptr;
+        if (otp && fn_set_tp) {
+            struct ggml_threadpool * tp = nullptr;
+            if (n_threads > 1 && n_threads <= WHISPER_OPT_TP_MAX) {
+                tp = otp->tp[n_threads];
+                if (!tp) {
+                    auto fn_new = (whisper_tp_new_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+                    if (fn_new) {
+                        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+                        const char * poll = getenv("WHISPER_OPT_TP_POLL");
+                        if (poll) {
+                            tpp.poll = atoi(poll);
+                        }
+                        tp = otp->tp[n_threads] = fn_new(&tpp);
+                    }
+                }
+            }
+            fn_set_tp(backend, tp); // nullptr: 1 thread, or more than WHISPER_OPT_TP_MAX
         }
     }
 
@@ -920,6 +982,13 @@ struct whisper_state {
     bool has_vad_segments = false;
 
     std::vector<vad_time_mapping> vad_mapping_table;
+
+    // [whisper-opt] experiments, see whisper_init_state
+    bool opt_out_rows = false;
+    bool opt_tp_on    = false;
+    int  opt_dec_threads = 0; // threads for token decoding (n_tokens < 16), 0 = n_threads
+    whisper_opt_threadpool opt_tp;
+    whisper_opt_threadpool * otp() { return opt_tp_on ? &opt_tp : nullptr; }
 };
 
 struct whisper_context {
@@ -2363,11 +2432,12 @@ static struct ggml_cgraph * whisper_build_graph_cross(
         struct ggml_tensor * v;
 
         if (wctx.params.flash_attn) {
+            // row sizes, so that a quantized cross KV ([whisper-opt] WHISPER_OPT_XKV) works too
             k = ggml_view_1d(ctx0, wstate.kv_cross.k, n_state*n_ctx,
-                    (ggml_element_size(wstate.kv_cross.k)*n_state)*(il*n_ctx_pad));
+                    ggml_row_size(wstate.kv_cross.k->type, n_state)*(il*n_ctx_pad));
 
             v = ggml_view_1d(ctx0, wstate.kv_cross.v, n_state*n_ctx,
-                    (ggml_element_size(wstate.kv_cross.v)*n_state)*(il*n_ctx_pad));
+                    ggml_row_size(wstate.kv_cross.v->type, n_state)*(il*n_ctx_pad));
         } else {
             Vcross = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcross, n_state, n_ctx));
 
@@ -2448,7 +2518,7 @@ static bool whisper_encode_internal(
         }
 
         if (!whisper_encode_external(wstate)) {
-            if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+            if (!ggml_graph_compute_helper(sched, gf, n_threads, true, wstate.otp())) {
                 return false;
             }
         } else {
@@ -2492,7 +2562,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, wstate.otp())) {
             return false;
         }
     }
@@ -2508,7 +2578,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, wstate.otp())) {
             return false;
         }
     }
@@ -2745,16 +2815,16 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 struct ggml_tensor * Kcross =
                     ggml_view_3d(ctx0, wstate.kv_cross.k,
                             n_state_head, n_audio_ctx, n_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state,
-                            ggml_element_size(wstate.kv_cross.k)*n_state_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state*n_audio_ctx_pad*il);
+                            ggml_row_size(wstate.kv_cross.k->type, n_state),
+                            ggml_row_size(wstate.kv_cross.k->type, n_state_head),
+                            ggml_row_size(wstate.kv_cross.k->type, n_state)*n_audio_ctx_pad*il);
 
                 struct ggml_tensor * Vcross =
                     ggml_view_3d(ctx0, wstate.kv_cross.v,
                             n_state_head, n_audio_ctx, n_head,
-                            ggml_element_size(wstate.kv_cross.v)*n_state,
-                            ggml_element_size(wstate.kv_cross.v)*n_state_head,
-                            ggml_element_size(wstate.kv_cross.v)*n_state*n_audio_ctx_pad*il);
+                            ggml_row_size(wstate.kv_cross.v->type, n_state),
+                            ggml_row_size(wstate.kv_cross.v->type, n_state_head),
+                            ggml_row_size(wstate.kv_cross.v->type, n_state)*n_audio_ctx_pad*il);
 
                 cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f, 0.0f);
 
@@ -2875,10 +2945,24 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 model.d_ln_b);
     }
 
-    // compute logits only for the last token
-    // comment this line to compute logits for all n_tokens
-    // might be useful in the future
-    //cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
+    // compute logits only for the tokens that need them (batch.logits[i] != 0):
+    // the prompt (up to n_text_ctx/2 tokens) needs only its last row, and the
+    // vocab projection is the largest matmul of the decoder
+    if (wstate.opt_out_rows) {
+        int n_outputs = 0;
+        for (int i = 0; i < n_tokens; ++i) {
+            n_outputs += batch.logits[i] != 0;
+        }
+        if (worst_case) {
+            n_outputs = std::min(n_tokens, WHISPER_MAX_DECODERS);
+        }
+        if (n_outputs > 0 && n_outputs < n_tokens) {
+            struct ggml_tensor * out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+            ggml_set_name(out_ids, "out_ids");
+            ggml_set_input(out_ids);
+            cur = ggml_get_rows(ctx0, cur, out_ids);
+        }
+    }
 
     struct ggml_tensor * logits = ggml_mul_mat(ctx0, model.d_te, cur);
 
@@ -3003,19 +3087,45 @@ static bool whisper_decode_internal(
             ggml_backend_tensor_set(KQ_mask, wstate.inp_mask.data(), 0, ggml_nelements(KQ_mask)*sizeof(float));
         }
 
+        struct ggml_tensor * out_ids = ggml_graph_get_tensor(gf, "out_ids");
+        if (out_ids) {
+            std::vector<int32_t> ids;
+            for (int i = 0; i < n_tokens; ++i) {
+                if (batch.logits[i] != 0) {
+                    ids.push_back(i);
+                }
+            }
+            ggml_backend_tensor_set(out_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
+
         logits = ggml_graph_node(gf, -1);
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        // [whisper-opt] token decoding is memory bound and syncs after every
+        // node: it may run on fewer threads than the encoder and the prompt
+        const int n_threads_cur = (wstate.opt_dec_threads > 0 && n_tokens < 16) ? wstate.opt_dec_threads : n_threads;
+        if (!ggml_graph_compute_helper(sched, gf, n_threads_cur, true, wstate.otp())) {
             return false;
         }
-    }
 
-    logits_out.resize(n_tokens*n_vocab);
-    for (int i = 0; i < n_tokens; i++) {
-        if (batch.logits[i] == 0) {
-            continue;
+        logits_out.resize(n_tokens*n_vocab);
+        if (out_ids) {
+            // row k of logits belongs to the k-th token with batch.logits != 0
+            int k = 0;
+            for (int i = 0; i < n_tokens; i++) {
+                if (batch.logits[i] == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*k), sizeof(float)*n_vocab);
+                k++;
+            }
+        } else {
+            for (int i = 0; i < n_tokens; i++) {
+                if (batch.logits[i] == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+            }
         }
-        ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
     }
 
     if (batch.n_tokens > 1) {
@@ -3455,6 +3565,13 @@ static std::string whisper_openvino_get_path_cache(std::string path_bin) {
 struct whisper_state * whisper_init_state(whisper_context * ctx) {
     whisper_state * state = new whisper_state;
 
+    state->opt_out_rows = whisper_opt_env("WHISPER_OPT_OUTROWS", false);
+    state->opt_tp_on    = whisper_opt_env("WHISPER_OPT_TP", false);
+    state->opt_dec_threads = getenv("WHISPER_OPT_DEC_T") ? atoi(getenv("WHISPER_OPT_DEC_T")) : 0;
+    if (state->opt_out_rows || state->opt_tp_on || state->opt_dec_threads) {
+        WHISPER_LOG_INFO("%s: whisper-opt: out_rows = %d, threadpool = %d, decode threads = %d\n", __func__, state->opt_out_rows, state->opt_tp_on, state->opt_dec_threads);
+    }
+
     state->backends = whisper_backend_init(ctx->params);
     if (state->backends.empty()) {
         WHISPER_LOG_ERROR("%s: whisper_backend_init() failed\n", __func__);
@@ -3484,7 +3601,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         WHISPER_LOG_INFO("%s: kv self size  = %7.2f MB\n", __func__, memory_size / 1e6);
     }
 
-    if (!whisper_kv_cache_init(state->kv_cross, state->backends[0], ctx->itype,
+    // [whisper-opt] WHISPER_OPT_XKV=q8_0: cross-attention K/V in q8_0 (flash attention only)
+    ggml_type xkv_type = ctx->itype;
+    if (getenv("WHISPER_OPT_XKV") && strcmp(getenv("WHISPER_OPT_XKV"), "q8_0") == 0 && ctx->params.flash_attn) {
+        xkv_type = GGML_TYPE_Q8_0;
+    }
+    if (!whisper_kv_cache_init(state->kv_cross, state->backends[0], xkv_type,
                 ctx->model.hparams.n_text_state,
                 ctx->model.hparams.n_text_layer,
                 GGML_PAD(ctx->model.hparams.n_audio_ctx, 256))) {
@@ -3932,6 +4054,17 @@ struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loa
 
 void whisper_free_state(struct whisper_state * state) {
     if (state) {
+        if (state->opt_tp.any()) {
+            for (auto & backend : state->backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto fn_set_tp = reg ? (whisper_tp_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool") : nullptr;
+                if (fn_set_tp) {
+                    fn_set_tp(backend, nullptr);
+                }
+            }
+            whisper_opt_tp_free(state->opt_tp);
+        }
         whisper_kv_cache_free(state->kv_self);
         whisper_kv_cache_free(state->kv_cross);
         whisper_kv_cache_free(state->kv_pad);
@@ -6835,6 +6968,10 @@ static bool whisper_vad(
 
     if (state->vad_context == nullptr) {
         struct whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
+        // [whisper-opt] one ggml graph per 32 ms window: threads only add synchronization
+        if (getenv("WHISPER_OPT_VAD_T")) {
+            vad_ctx_params.n_threads = atoi(getenv("WHISPER_OPT_VAD_T"));
+        }
         struct whisper_vad_context * vctx = whisper_vad_init_from_file_with_params(params.vad_model_path, vad_ctx_params);
         if (vctx == nullptr) {
             WHISPER_LOG_ERROR("%s: failed to initialize VAD context\n", __func__);
